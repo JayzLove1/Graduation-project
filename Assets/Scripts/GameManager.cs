@@ -1,878 +1,659 @@
+// Unity 与 Python RL 后端的核心调度桥梁
+// 负责 IPC 通信（Windows 共享内存）、奖励重塑、训练调度和断点续训
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Text;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
-// 游戏核心大管家 (GameManager)
-// 这个脚本就是咱们这边的老大，主要管这几件事情：
-// 1. 管一下背后的 Python什么时候开始什么时候结束。
-// 2. 管“共享内存管道”，好让 C# 和 Python交互通信。
-// 3. 记账大师，算算走了几步走错了算几下，算算到底过了多少局。
-// 4. 把游戏里的情报送给AI，然后把AI想出来的步子指挥方块。
 public class GameManager : MonoBehaviour
 {
     public static GameManager instance;
-    [Header("AI角色")]
-    [Tooltip("场景中实际移动的智能体对象")]
+    #region ========== 配置与状态 ==========
+    [Header("AI 角色与环境")]
     public PlayerController aiPlayer;
-    [Header("奖励设置")]
-    [Tooltip("全局奖励打分板定义")]
+    [Header("奖励配置")]
     public RewardConfig rewardConfig;
-    [Header("UI 界面")]
-    [Tooltip("实时绘制训练曲线的图表组件")]
+    [Header("训练图表")]
     public MazeAI.UI.TrainingChartUI trainingChart;
-    [Header("Python脚本路径")]
-    [Tooltip("指向本地 rl_maze_ai_qlearning.py 的绝对或相对路径")]
-    public string pythonScriptPath = Application.dataPath + "/Python/rl_maze_ai_qlearning.py";
-    // 运行模式：0=手动测试, 1=算法自动训练, 2=模型加载演示
+    [Header("运行模式")]
     public int runMode;
-    // 选择算法：0=Q-Learning, 1=DQN, 2=PPO
     public int selectAlgorithm;
-    // 自动训练用的连续测试索引
-    public int currentSeedIndex = 0;
-    // 自动训练用的探索率回合记录
-    [HideInInspector] public System.Collections.Generic.List<float> episodeEpsilonHistory = new System.Collections.Generic.List<float>();
-    // PPO 自动训练奖励收敛检测：当前地图的逐局奖励记录（切图时清空）
-    private System.Collections.Generic.List<float> _ppoMapRewardHistory = new System.Collections.Generic.List<float>();
-    // 训练超参数面板映射
+    public int currentSeedIndex;
+    [HideInInspector] public int episodeCount;
+    [HideInInspector] public float episodeTotalReward;
+    [HideInInspector] public int episodeStepCount;
+    [HideInInspector] public int totalSuccessCount;
+    [HideInInspector] public int hitCount;
+    private float pendingReward;
+    private bool isResettingEpisode;
+    // 防重入锁：OnSceneLoaded 和 GameInit.Start 都会调用 InitAfterSceneLoaded，
+    // 第二次进入会重置共享内存并启动重复握手协程
+    private bool _isTrainInitializing;
+    private float _lastDistanceToGoal = -1;
+    public Vector2 goalPos;
+    private readonly HashSet<Vector2Int> _visitedCells = new();
+    private readonly Dictionary<Vector2Int, int> _cellVisitCount = new();
+    // 步数上限由 SyncGridData 按地图大小计算，0=未初始化（不启用）
+    private int _maxStepsPerEpisode;
+    [HideInInspector] public List<float> rewardHistory = new();
+    [HideInInspector] public List<int> stepHistory = new();
+    // epsilonHistory：QL/DQN 记录 epsilon，PPO 记录 entropy_coeff，供图表绘制
+    [HideInInspector] public List<float> epsilonHistory = new();
+    private List<float> _ppoMapRewardHistory = new();
+    // 与 _ppoMapRewardHistory 一一对应，true = ReachEnd 真通关
+    // 用真实信号而非 reward 阈值，避免 BFS shaping 累积后未通关局也能超阈值
+    private List<bool> _ppoMapSuccessHistory = new();
+    private bool _lastEpisodeWasSuccess;
     public TrainParam trainParam;
-    // 当前回合内的撞墙累计次数
-    public int hitCount;
-    // ========== 训练指标统计 ==========
-    [HideInInspector] public int episodeCount = 0;        // 历史已执行的回合总数
-    [HideInInspector] public float episodeTotalReward = 0; // 本回合累计获得的奖励(Reward)合计数
-    [HideInInspector] public int episodeStepCount = 0;     // 本回合已经走过的格数
-    [HideInInspector] public int totalSuccessCount = 0;    // 历史成功抵达终点的次数（用于计算胜率）
-    // 由于移动和撞墙是连续高速发生的，为防止单帧内多次通信产生读写冲突或奖励漏算，
-    // 将日常奖励缓存至 pendingReward，并在下一次发送 STATE 时一并打包传给 Python。
-    private float pendingReward = 0;
-    private bool isResettingEpisode = false; // 防止终点双重触发导致 CreateMaze 逻辑重入崩盘
-    // ============ [第一步：奖励重塑相关变量] ============
-    private float _lastDistanceToGoal = -1; // 上一步离终点的距离
-    public Vector2 goalPos;                // 目标点（终点）坐标 (由 MazeGenerator 告知)
-    private System.Collections.Generic.HashSet<Vector2Int> _visitedCells = new System.Collections.Generic.HashSet<Vector2Int>();
-    // ============ [循环检测与步数限制] ============
-    private System.Collections.Generic.Dictionary<Vector2Int, int> _cellVisitCount = new System.Collections.Generic.Dictionary<Vector2Int, int>(); // 每格被踩的次数
-    // ========== 实时图表持久化数据 ==========
-    [HideInInspector] public System.Collections.Generic.List<float> rewardHistory = new System.Collections.Generic.List<float>();
-    [HideInInspector] public System.Collections.Generic.List<int> stepHistory = new System.Collections.Generic.List<int>();
-    [HideInInspector] public System.Collections.Generic.List<float> epsilonHistory = new System.Collections.Generic.List<float>();
-    // IPC 进程间通信组件
     private MemoryMappedFile mmf;
     private MemoryMappedViewAccessor view;
     private Process pythonProcess;
     private bool isPythonProcessRunning;
     private bool hasReceivedReady;
-    // 共享内存大小（字节），C#与Python必须严格保证一致大小
     private const int DATA_SIZE = 4096;
-    public enum RewardType
-    {
-        NormalMove, // 走到合法空白格
-        HitWall,    // 撞到墙壁被阻挡
-        ReachEnd,   // 顺利抵达终点
-    }
+    public enum RewardType { NormalMove, HitWall, ReachEnd }
     [Serializable]
     public class RewardConfig
     {
-        public float normalMoveReward = -0.05f;  // 削弱闲逛惩罚，防止AI不敢动弹
-        public float hitWallReward = -0.5f;      // 恢复其他算法的默认设定
-        public float reachEndReward = 100f;      // 恢复其他算法的默认设定
+        public float normalMoveReward = -0.05f;
+        public float hitWallReward = -0.5f;
+        public float reachEndReward = 100f;
     }
     [Serializable]
     public class TrainParam
     {
-        public float lr = 0.1f;           // 学习率 (Alpha)
-        public float gamma = 0.95f;       // 衰减因子 (Gamma) — 提高到0.95让终点信号传播更远
-        public float epsilon = 0.9f;      // 探索率 (Epsilon)
-        public float epsilonDecay = 0.995f; // 探索衰减率 (Python端会根据迷宫大小动态调整)
-        public int batchSize = 32;        // 经验回放批次大小
-        public float algoLr = 0.001f;     // 神经网络学习率 (DQN/PPO预留)
+        public float lr = 0.1f;
+        public float gamma = 0.99f;
+        public float epsilon = 1.0f;
+        public float epsilonDecay = 0.995f;
+        public int batchSize = 32;
+        public float algoLr = 0.001f;
     }
+    #endregion
+    #region ========== 生命周期 ==========
     private void Awake()
     {
-        if (instance == null)
-            instance = this;
-        else
-            Destroy(gameObject);
-        // 保证 GameManager 跨场景不被摧毁，因为包含底层 IPC 句柄
-        DontDestroyOnLoad(gameObject);
-    }
-    private void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene, UnityEngine.SceneManagement.LoadSceneMode mode)
-    {
-        if (scene.name == "GameScene")
-        {
-            // 在游玩关卡场景载入后，重新绑定游玩角色
-            GameObject playerObj = GameObject.FindGameObjectWithTag("Player");
-            if (playerObj != null)
-            {
-                aiPlayer = playerObj.GetComponent<PlayerController>();
-            }
-            InitAfterSceneLoaded();
-        }
+        if (instance == null) { instance = this; DontDestroyOnLoad(gameObject); }
+        else Destroy(gameObject);
     }
     private void Start()
     {
-        runMode = 0; // 默认采用手动测试模式
+        runMode = 0;
         UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnSceneLoaded;
-        // 一次性迁移：将旧版 PlayerPrefs key 转换为包含迷宫尺寸的新格式
         MigrateOldSeedKeys();
     }
-    /// <summary>
-    /// 将旧格式的种子 key (MazeRandomSeed_{algo}) 迁移到新格式 (MazeRandomSeed_{algo}_{size})
-    /// 只执行一次，迁移完成后写入标记防止重复执行
-    /// </summary>
-    private void MigrateOldSeedKeys()
+    private void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene, UnityEngine.SceneManagement.LoadSceneMode mode)
     {
-        if (PlayerPrefs.GetInt("SeedKeyMigrated_v2", 0) == 1) return; // 已迁移过
-        for (int algo = 0; algo <= 2; algo++)
-        {
-            string oldSeedKey = "MazeRandomSeed_" + algo;
-            string oldWidthKey = "MazeSavedWidth_" + algo;
-            string oldHeightKey = "MazeSavedHeight_" + algo;
-            if (PlayerPrefs.HasKey(oldSeedKey))
-            {
-                int oldSeed = PlayerPrefs.GetInt(oldSeedKey);
-                int oldW = PlayerPrefs.GetInt(oldWidthKey, 11); // 默认按简单模式
-                // 写入新格式 key
-                string newKey = $"MazeRandomSeed_{algo}_{oldW}";
-                PlayerPrefs.SetInt(newKey, oldSeed);
-                Debug.Log($"<color=green>[数据迁移] 算法{algo} 尺寸{oldW} 种子{oldSeed} -> {newKey}</color>");
-                // 清理旧 key
-                PlayerPrefs.DeleteKey(oldSeedKey);
-                PlayerPrefs.DeleteKey(oldWidthKey);
-                PlayerPrefs.DeleteKey(oldHeightKey);
-            }
-        }
-        PlayerPrefs.SetInt("SeedKeyMigrated_v2", 1);
-        PlayerPrefs.Save();
-        Debug.Log("[数据迁移] 旧版种子 Key 迁移完成！");
+        if (scene.name != "GameScene") return;
+        var playerObj = GameObject.FindGameObjectWithTag("Player");
+        if (playerObj != null) aiPlayer = playerObj.GetComponent<PlayerController>();
+        InitAfterSceneLoaded();
     }
     private void OnDestroy()
     {
-        // 程序退出前务必安全卸载 Python 进程和内存句柄，防止形成僵尸进程
         StopPythonProcess();
         CloseSharedMemory();
+        PlayerPrefs.Save(); // 兜底刷盘：防止最近几局数据未达刷盘阈值而丢失
     }
-    #region 模式 & 算法切换
-    public void SwitchRunMode(int mode)
-    {
-        runMode = mode;
-    }
-    // 大厅选择完模式后，进入正式场景第一时间叫它。
+    #endregion
+    #region ========== 初始化 ==========
     public void InitAfterSceneLoaded()
     {
-        if (aiPlayer == null)
-            return;
+        if (aiPlayer == null || _isTrainInitializing) return;
         aiPlayer.canMove = true;
         aiPlayer.ResetPlayer();
         hitCount = 0;
-        if (runMode == 0)
-        {
-            StopPythonProcess(); // 手动模式确保关闭 Python
-        }
-        else
-        {
-            StartPythonProcess();
-            InitSharedMemory();
-            // 在训练/演示模式下，主动发出第一个起步信号
-            StartTrain();
-        }
+        if (runMode == 0) { StopPythonProcess(); return; }
+        _isTrainInitializing = true;
+        StartPythonProcess();
+        InitSharedMemory();
+        // sceneLoaded 在所有对象 Start() 之前触发，此时 MazeGenerator.maze 还是 null，
+        // 延迟一帧让 CreateMaze() 完成后再发 GRID
+        StartCoroutine(DelayedStartTrain());
     }
-    // 收到大厅的选择后，把算法要用的脑补参数发给后面的大黑盒
+    private IEnumerator DelayedStartTrain()
+    {
+        yield return null;
+        StartTrain();
+        _isTrainInitializing = false;
+    }
+    public void SwitchRunMode(int mode) => runMode = mode;
     public void SwitchAlgorithm(int algo)
     {
         selectAlgorithm = algo;
-        // 首次初始化参数
         UpdateRealtimeParams();
-        // 算法切换后，立刻重新加载该算法在该难度下的历史战绩
         LoadHistoryData();
     }
-    /// <summary>
-    /// 将最新的超参数实时同步给 Python 后端，让 AI 立即执行新的学习策略
-    /// </summary>
     public void UpdateRealtimeParams()
     {
         if (view == null) return;
         SendDataToPython($"ALGO:{selectAlgorithm}");
-        SendDataToPython($"PARAM:{trainParam.lr},{trainParam.gamma},{trainParam.epsilon},{trainParam.epsilonDecay},{trainParam.batchSize},{trainParam.algoLr}");
-        Debug.Log($"<color=yellow>[Param Update] 参数同步完成: LR:{trainParam.lr} | Gamma:{trainParam.gamma} | Eps:{trainParam.epsilon}</color>");
+        // epsilon_decay 用 "_" 占位：Python 端按迷宫大小自适应，避免 UI 默认值覆盖
+        SendDataToPython($"PARAM:{trainParam.lr},{trainParam.gamma},{trainParam.epsilon},_,{trainParam.batchSize},{trainParam.algoLr}");
+        Debug.Log($"<color=yellow>[IPC] 超参数同步: {GetAlgorithmName()} | lr={trainParam.lr:F4} | γ={trainParam.gamma:F2} | ε={trainParam.epsilon:F4} | batch={trainParam.batchSize} | algoLr={trainParam.algoLr:F4}</color>");
     }
-    // 获取当前训练组合的唯一标识符（算法ID+迷宫尺寸）
-    private string GetHistoryKey()
+    public string GetAlgorithmName() => selectAlgorithm switch
     {
-        // 格式如：HistoryData_0_11 (表示 Q-Learning, 11x11 难度)
-        return $"HistoryData_{selectAlgorithm}_{GameData.mazeWidth}";
-    }
-    private void SaveHistoryData()
-    {
-        string key = GetHistoryKey();
-        // 将 List 转为逗号分隔的字符串存储
-        string rewardStr = string.Join(",", rewardHistory);
-        string stepStr = string.Join(",", stepHistory);
-        PlayerPrefs.SetString(key + "_Reward", rewardStr);
-        PlayerPrefs.SetString(key + "_Step", stepStr);
-        PlayerPrefs.Save();
-    }
-    private void LoadHistoryData()
-    {
-        rewardHistory.Clear();
-        stepHistory.Clear();
-        string key = GetHistoryKey();
-        if (PlayerPrefs.HasKey(key + "_Reward"))
-        {
-            string[] rewards = PlayerPrefs.GetString(key + "_Reward").Split(',');
-            foreach (var r in rewards) { if (float.TryParse(r, out float val)) rewardHistory.Add(val); }
-        }
-        if (PlayerPrefs.HasKey(key + "_Step"))
-        {
-            string[] steps = PlayerPrefs.GetString(key + "_Step").Split(',');
-            foreach (var s in steps) { if (int.TryParse(s, out int val)) stepHistory.Add(val); }
-        }
-        // 加载完数据后，通知 UI 刷新显示
-        if (trainingChart != null)
-        {
-            trainingChart.UpdateChartTitle();
-            trainingChart.AddDataPoint(0, 0); // 触发重绘
-        }
-    }
-    public string GetAlgorithmName()
-    {
-        return selectAlgorithm switch
-        {
-            0 => "Q-Learning",
-            1 => "DQN",
-            2 => "PPO",
-            _ => "Unknown"
-        };
-    }
+        0 => "Q-Learning",
+        1 => "DQN",
+        2 => "PPO",
+        _ => "AI_Backend"
+    };
     #endregion
-    #region 奖励发放系统
-    // 小球碰到了好事或者坏事（走路、撞墙、通关），就会找这就行结算登记
+    #region ========== 奖励重塑 ==========
     public void TriggerReward(RewardType type)
     {
         float reward = type switch
         {
-            RewardType.NormalMove => rewardConfig.normalMoveReward,
-            RewardType.HitWall => (selectAlgorithm == 2) ? -1.0f : rewardConfig.hitWallReward, // PPO 专属撞墙巨罚
-            RewardType.ReachEnd => (selectAlgorithm == 2) ? 50f : rewardConfig.reachEndReward, // PPO 专属终点平滑分
+            // PPO 步惩罚 -0.15（DQN/QL -0.05）：让路径长度影响总分，
+            // 防止 +500 通关奖励过大导致智能体通关后不再优化路径
+            RewardType.NormalMove => (selectAlgorithm == 2) ? -0.15f : rewardConfig.normalMoveReward,
+            RewardType.HitWall => (selectAlgorithm == 2) ? -0.3f : rewardConfig.hitWallReward,
+            // PPO 通关奖励 +500：on-policy batch 中约 98% 为超时样本，
+            // 通关轨迹 advantage 必须远大于超时轨迹才不会被淹没
+            RewardType.ReachEnd => (selectAlgorithm == 2) ? 500f : rewardConfig.reachEndReward,
             _ => 0,
         };
-        // ============ [奖励重塑逻辑：距离启发式 & 探索奖励] ============
         if (type == RewardType.NormalMove && aiPlayer != null)
         {
-            Vector2 currentPos = aiPlayer.transform.position;
-            float currentDist = Vector2.Distance(currentPos, goalPos);
-            // 1. 距离奖励 (Potential Reward): 改为直接使用连续的差值，绝对保证前后移动积分抵消，防止原地横跳刷分漏洞
+            Vector2 curPos = aiPlayer.transform.position;
+            float curDist = Vector2.Distance(curPos, goalPos);
             if (_lastDistanceToGoal > 0)
             {
-                float diff = _lastDistanceToGoal - currentDist;
-                // 【核心修复】：根据你的要求，修改仅限 PPO 算法
-                // 其他算法依然保持 diff * 1.0f 的严苛机制
-                float distanceMultiplier = (selectAlgorithm == 2) ? 0.1f : 1.0f;
-                reward += diff * distanceMultiplier;
+                float diff = _lastDistanceToGoal - curDist;
+                // PPO 的距离 shaping 由 Python 端 BFS 替代：欧氏距离在迷宫拐角处
+                // 会给唯一正确方向负奖励，导致 PPO 学会"避开出口"
+                float multiplier = (selectAlgorithm == 2) ? 0f : 1f;
+                reward += diff * multiplier;
             }
-            _lastDistanceToGoal = currentDist;
-            // 2. 探索奖励 (Exploration Reward): 第一次走到的格子额外加分，重复走的扣分
-            Vector2Int gridPos = new Vector2Int(Mathf.RoundToInt(currentPos.x), Mathf.RoundToInt(currentPos.y));
+            _lastDistanceToGoal = curDist;
+            var gridPos = new Vector2Int(Mathf.RoundToInt(curPos.x), Mathf.RoundToInt(curPos.y));
             if (!_visitedCells.Contains(gridPos))
             {
-                reward += 0.2f; // 适当降低发现新格子过高的奖励，防止它沉迷走路忘了终极目标
+                // PPO 探索奖励 0.3（DQN/QL 0.2）
+                float bonus = (selectAlgorithm == 2) ? 0.3f : 0.2f;
+                reward += bonus;
                 _visitedCells.Add(gridPos);
                 _cellVisitCount[gridPos] = 1;
             }
             else
             {
-                // 递增式重复惩罚：踩得越多罚得越狠，有效打破循环陷阱
-                if (!_cellVisitCount.ContainsKey(gridPos)) _cellVisitCount[gridPos] = 1;
-                _cellVisitCount[gridPos]++;
-                int visitNum = _cellVisitCount[gridPos];
-                // 基础 -0.1，每多踩一次额外 -0.05，上限 -1.0
-                float loopPenalty = Mathf.Min(0.1f + (visitNum - 2) * 0.05f, 1.0f);
-                reward -= loopPenalty;
+                _cellVisitCount.TryGetValue(gridPos, out int cnt);
+                _cellVisitCount[gridPos] = ++cnt;
+                // PPO 重复访问惩罚 -0.03
+                // 叠加超时 -500 后 critic 对所有状态估值极低，advantage 信噪比差，
+                // BFS 方向梯度被淹没。-0.03 仍能打破短期振荡但不压制方向信号
+                float perVisit = (selectAlgorithm == 2) ? -0.03f : -0.05f;
+                reward += perVisit * Mathf.Min(cnt - 1, 5); // 封顶 5 次防梯度爆炸
             }
         }
-        // 统计面板数据累加
+        pendingReward += reward;
         episodeTotalReward += reward;
-        episodeStepCount++;
-        if (type == RewardType.HitWall)
-            hitCount++;
-        // 全算法步数上限截断控制：防止 agent 在大迷宫中无限循环
-        // 根据迷宫面积动态计算：小迷宫(11x11)=6050步, 大迷宫(15x15)=11250步, PPO保持30000
-        int maxSteps;
-        if (selectAlgorithm == 2)
-          maxSteps = GameData.mazeWidth * GameData.mazeHeight * 50;
-        else
-            maxSteps = GameData.mazeWidth * GameData.mazeHeight * 50; // DQN/QL: 面积×50
-        bool isTimeout = (episodeStepCount >= maxSteps);
-        if (type == RewardType.ReachEnd || isTimeout)
+        if (type == RewardType.HitWall) { hitCount++; return; }
+        if (type == RewardType.ReachEnd)
         {
-            if (isTimeout)
-            {
-                // 超时惩罚，这把算是废了
-                float timeoutPenalty = (selectAlgorithm == 2) ? 5.0f : 10.0f; // DQN/QL 给更重的超时罚分
-                reward -= timeoutPenalty;
-                episodeTotalReward -= timeoutPenalty;
-            }
-            // 实时更新 UI 数据报表
-            if (trainingChart != null)
-            {
-                trainingChart.AddDataPoint(episodeTotalReward, episodeStepCount);
-            }
-            // 终点或者超时，不再需要 Python 返回后续行动，发送强力经验包
-            // rtype: 2=通关, 1=非通关被截断
-            int rtype = (type == RewardType.ReachEnd) ? 2 : 1;
-            SendDataToPython($"REWARD:{reward}|0|0|{rtype}");
-            if (runMode == 1 || runMode == 2 || runMode == 3)
-            {
-                if (type == RewardType.ReachEnd)
-                    totalSuccessCount++;
-                episodeCount++;
-                // 自动训练：按回合记录探索率用于判断是否收敛
-                episodeEpsilonHistory.Add(trainParam.epsilon);
-                if (episodeEpsilonHistory.Count > 50) episodeEpsilonHistory.RemoveAt(0);
-                // 实时压入持久化曲线数据
-                rewardHistory.Add(episodeTotalReward);
-                // PPO 自动挂机训练：额外记录当前地图的奖励数据用于收敛判定
-                if (selectAlgorithm == 2 && runMode == 3)
-                    _ppoMapRewardHistory.Add(episodeTotalReward);
-                stepHistory.Add(episodeStepCount);
-                if (rewardHistory.Count > 100) rewardHistory.RemoveAt(0);
-                if (stepHistory.Count > 100) stepHistory.RemoveAt(0);
-                // 同步记录 Epsilon 历史用于绘图（每局记录一次，与 reward/step 保持同频）
-                epsilonHistory.Add(trainParam.epsilon);
-                if (epsilonHistory.Count > 100) epsilonHistory.RemoveAt(0);
-                // 立即持久化到本地硬盘，防止程序崩溃丢失数据
-                SaveHistoryData();
-                Debug.Log($"[系统统计] 第 {episodeCount} 回合结束! 步数:{episodeStepCount} 撞墙:{hitCount} 状态:{(rtype==2?"通关":"超时重置")} 累计奖励:{episodeTotalReward:F1} 历史通关率:{(float)totalSuccessCount / episodeCount * 100:F1}%");
-                // 数据归位
-                episodeTotalReward = 0;
-                episodeStepCount = 0;
-                // 统一交给协同程序处理下一回合或切换地图逻辑
-                StartCoroutine(AutoNextEpisode());
-            }
-            else
-            {
-                // 手动模式
-                if (type == RewardType.ReachEnd)
-                {
-                    if (aiPlayer != null) aiPlayer.LockMovement();
-                    UIManager.instance?.ShowPanel("EndPanel");
-                }
-                else
-                {
-                    if (aiPlayer != null) aiPlayer.ResetPlayer();
-                    episodeStepCount = 0;
-                }
-            }
+            if (isResettingEpisode) return;
+            isResettingEpisode = true;
+            _lastEpisodeWasSuccess = true;
+            totalSuccessCount++;
+            Debug.Log($"<color=green>★ [通关] {GetAlgorithmName()} | 局:{episodeCount + 1} | 步:{aiPlayer.stepCount} | 撞:{hitCount} | 分:{episodeTotalReward:F1}</color>");
+            SendDataToPython($"REWARD:{reward}|{aiPlayer.stepCount}|1|2");
+            StartCoroutine(ResetEpisodeRoutine());
         }
-        else
-        {
-            // 对于高频度发生的基础移动和撞墙行为，将其放进账本（pendingReward），
-            // 在下一个 OnAIMoveComplete 时由统一管道发出，提升通信吞吐稳定性并防止数据覆盖
-            pendingReward += reward;
-        }
-    }
-    // 一局打完了，负责清理然后再开下一把
-    private IEnumerator AutoNextEpisode()
-    {
-        // 训练模式用极短等待加速迭代，其他模式保持安全间隔
-        float gap = (runMode == 1 || runMode == 3) ? 0.02f : 0.1f;
-        if (aiPlayer != null) aiPlayer.LockMovement();
-        // 停留在终点一瞬间，让你能看清
-        yield return new WaitForSeconds(gap);
-        // 重置环境，发送 COMMAND:RESET 给 Python
-        ResetTrain();
-        // 发送完 RESET 后稍等，以便 Python 处理存盘
-        yield return new WaitForSeconds(gap);
-        // 如果是自动化挂机训练模式，就验证一下是不是需要自动切图了
-        if (runMode == 3)
-        {
-            if (CheckAutoTrainConvergence())
-            {
-                // 如果已经触发切图/切算法，就不必执行这局后续开头的运算了，中断携程！
-                yield break;
-            }
-        }
-        if (aiPlayer != null)
-            aiPlayer.canMove = true;
-        // AI 已经重生至起点，让其开始推算新的一局
-        OnAIMoveComplete();
     }
     #endregion
-    #region AI控制与通信
-    // 只要小球走完一步了，立马问 Python 下一步往哪里走。
+    #region ========== IPC 共享内存 ==========
+    private void InitSharedMemory()
+    {
+        try
+        {
+            mmf = MemoryMappedFile.CreateOrOpen("MazeRLSharedMemory", DATA_SIZE);
+            view = mmf.CreateViewAccessor();
+            hasReceivedReady = false;
+        }
+        catch (Exception e) { Debug.LogError($"[IPC] 内存映射分配失败: {e.Message}"); }
+    }
+    private void CloseSharedMemory()
+    {
+        view?.Dispose(); mmf?.Dispose();
+        view = null; mmf = null;
+    }
+    public void SendDataToPython(string data)
+    {
+        if (view == null) return;
+        byte[] bytes = Encoding.UTF8.GetBytes(data.PadRight(DATA_SIZE, '\0'));
+        view.WriteArray(0, bytes, 0, DATA_SIZE);
+    }
+    public string ReadDataFromPython()
+    {
+        if (view == null) return "";
+        byte[] bytes = new byte[DATA_SIZE];
+        view.ReadArray(0, bytes, 0, DATA_SIZE);
+        return Encoding.UTF8.GetString(bytes).TrimEnd('\0').Trim();
+    }
+    #endregion
+    #region ========== Python 进程管控 ==========
+    private void StartPythonProcess()
+    {
+        if (isPythonProcessRunning) return;
+        try
+        {
+            string script = selectAlgorithm switch
+            {
+                0 => "rl_maze_ai_qlearning.py",
+                1 => "rl_maze_ai_dqn.py",
+                _ => "rl_maze_ai_ppo.py"
+            };
+            var psi = new ProcessStartInfo
+            {
+                FileName = "python",
+                Arguments = $"-u \"{Path.Combine(Application.dataPath, "Python", script)}\"",
+                UseShellExecute = true,
+                CreateNoWindow = false
+            };
+            pythonProcess = Process.Start(psi);
+            isPythonProcessRunning = true;
+            Debug.Log($"[Backend] Python 启动 (PID:{pythonProcess.Id}, Script:{script})");
+        }
+        catch (Exception e) { Debug.LogError($"[Backend] 启动失败，请检查 Python 路径: {e.Message}"); }
+    }
+    public void StopPythonProcess()
+    {
+        if (pythonProcess != null && !pythonProcess.HasExited)
+        {
+            SendDataToPython("COMMAND:QUIT");
+            System.Threading.Thread.Sleep(200);
+            try { pythonProcess.Kill(); } catch { }
+            pythonProcess.Dispose();
+        }
+        pythonProcess = null;
+        isPythonProcessRunning = false;
+        hasReceivedReady = false;
+    }
+    #endregion
+    #region ========== 训练调度 ==========
+    public void StartTrain()
+    {
+        if (runMode == 0 || aiPlayer == null) return;
+        StartCoroutine(StartTrainRoutine());
+    }
+    private IEnumerator StartTrainRoutine()
+    {
+        // 阶段 1：等待 Python 后端发送 READY（超时 30s）
+        float timeout = 0;
+        while (!hasReceivedReady && timeout < 30f)
+        {
+            if (ReadDataFromPython() == "READY") { hasReceivedReady = true; break; }
+            yield return new WaitForSeconds(0.2f);
+            timeout += 0.2f;
+        }
+        if (!hasReceivedReady)
+        {
+            Debug.LogError("[IPC] 握手失败：Python 未响应 READY"); yield break;
+        }
+        // 阶段 2：发送 GRID 并等待 GRID_OK
+        // DQN/PPO 必须收到 GRID_OK，否则网络未初始化，全程返回 ACTION:0（静默跑空模型）
+        // Q-Learning 不回复 GRID_OK，超时直接继续
+        bool gridConfirmed = false;
+        int maxAttempts = (selectAlgorithm == 0) ? 1 : 3;
+        for (int attempt = 0; attempt < maxAttempts && !gridConfirmed; attempt++)
+        {
+            if (attempt > 0)
+                Debug.LogWarning($"[IPC] 未收到 GRID_OK (尝试 {attempt}/{maxAttempts})，重发 GRID...");
+            SyncGridData();
+            float elapsed = 0f;
+            while (elapsed < 5f)
+            {
+                if (ReadDataFromPython() == "GRID_OK") { gridConfirmed = true; break; }
+                yield return new WaitForSeconds(0.1f);
+                elapsed += 0.1f;
+            }
+        }
+        if (!gridConfirmed && selectAlgorithm != 0)
+        {
+            Debug.LogError($"[IPC FATAL] {GetAlgorithmName()} 网络初始化失败：{maxAttempts} 次 GRID 均无 GRID_OK，训练中止");
+            StopPythonProcess(); yield break;
+        }
+        // 阶段 3：推送超参数 → 发送训练指令 → 启动动作循环
+        UpdateRealtimeParams();
+        ResumeEpisodeCount();
+        SendDataToPython(runMode == 2 ? "COMMAND:DEMO" : "COMMAND:START");
+        aiPlayer.canMove = true;
+        yield return new WaitForSeconds(0.3f);
+        OnAIMoveComplete(); // 触发首帧 STATE，之后由 PlayerController 回调驱动闭环
+    }
+    private void SyncGridData()
+    {
+        var gen = FindAnyObjectByType<MazeGenerator>();
+        if (gen == null) { Debug.LogError("[IPC] SyncGridData 失败：找不到 MazeGenerator"); return; }
+        if (gen.maze == null) { Debug.LogError("[IPC] SyncGridData 失败：maze 为 null，DelayedStartTrain 未等待一帧"); return; }
+        int w = gen.Width, h = gen.Height;
+        // 步数上限 6×w×h（15×15=1350）：随机游走混合时间约 O(n²)≈11000，
+        // 675 步时初始随机策略几乎走不到终点，1350 步显著提升首次通关概率
+        _maxStepsPerEpisode = 6 * w * h;
+        var sb = new StringBuilder($"GRID:{w}|{h}|{gen.currentSeed}|");
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                sb.Append(gen.maze[x, y] == 1 ? "1" : "0");
+                if (x < w - 1 || y < h - 1) sb.Append(',');
+            }
+        SendDataToPython(sb.ToString());
+        Debug.Log($"[IPC] GRID 发送：{w}×{h}, seed={gen.currentSeed}");
+    }
     public void OnAIMoveComplete()
     {
-        if (!isPythonProcessRunning || runMode == 0 || aiPlayer == null)
-            return;
-        // 必须开携程，因为物理状态改变和 IPC读取不能阻塞 Unity 的主渲染线程
+        if (!isPythonProcessRunning || runMode == 0) return;
+        // 步数超限：强制以失败结束 episode，阻止错误轨迹持续污染 on-policy buffer
+        if (_maxStepsPerEpisode > 0 && aiPlayer != null
+            && aiPlayer.stepCount >= _maxStepsPerEpisode && !isResettingEpisode)
+        {
+            TriggerTimeoutFailure(); return;
+        }
         StartCoroutine(RequestActionCoroutine());
     }
+    private void TriggerTimeoutFailure()
+    {
+        if (isResettingEpisode) return;
+        isResettingEpisode = true;
+        _lastEpisodeWasSuccess = false;
+        // 超时惩罚 -500：与通关 +500 对称，让"超时=坏"产生等量级梯度
+        float penalty = (selectAlgorithm == 2) ? -500f : -10f;
+        pendingReward += penalty;
+        episodeTotalReward += penalty;
+        // rtype=3：Python 端据此写终止标记并临时回升 entropy_coeff
+        SendDataToPython($"REWARD:{penalty}|{aiPlayer.stepCount}|0|3");
+        Debug.Log($"<color=orange>⚠ [超时] {GetAlgorithmName()} | 局:{episodeCount + 1} | 步:{aiPlayer.stepCount} | 分:{episodeTotalReward:F1}</color>");
+        StartCoroutine(ResetEpisodeRoutine());
+    }
+    private int _consecutiveActionTimeouts;
+    private const int MAX_ACTION_TIMEOUTS = 3;
     private IEnumerator RequestActionCoroutine()
     {
-        // 故意让出当前帧执行权限，等待上一帧由于角色位移带来的底层碰撞与逻辑收尾完毕
         yield return null;
-        // 确保共享内存已被清除，避免Python读到旧数据
-        // 训练模式缩短等待以提升迭代速度，其他模式保持安全间隔
-        yield return new WaitForSeconds((runMode == 1) ? 0.02f : 0.1f);
-        // 1. 发射包含角色实时空间坐标、步数以及所有沿途结算奖励的数据包给 Python。
-        string state = $"STATE:{aiPlayer.transform.position.x}|{aiPlayer.transform.position.y}|{aiPlayer.canMove}|{aiPlayer.stepCount}|{pendingReward}";
-        SendDataToPython(state);
-        pendingReward = 0; // 发射后立刻清零本地账本
+        yield return new WaitForSeconds((runMode == 1 || runMode == 3) ? 0.01f : 0.1f);
+        SendDataToPython($"STATE:{aiPlayer.transform.position.x}|{aiPlayer.transform.position.y}|{aiPlayer.canMove}|{aiPlayer.stepCount}|{pendingReward}");
+        pendingReward = 0;
         string actionData = "";
-        float timeout = 5.0f; // 死锁防卫：增加超时时间到5秒，给深度学习计算更充裕的时间
-        float timePassed = 0f;
-        // 2. 将 C# 的当前携程暂停，去 IPC 隧道里紧密轮询探查 Python 的 "ACTION" 指令答复
-        while (timePassed < timeout)
+        float wait = 0;
+        while (wait < 5f)
         {
             actionData = ReadDataFromPython();
-            if (actionData.StartsWith("ACTION:"))
-            {
-                break; // 接头成功,跳出等待
-            }
+            if (actionData.StartsWith("ACTION:")) break;
             yield return null;
-            timePassed += Time.deltaTime;
+            wait += Time.deltaTime;
         }
-        // 3. 执行获取到的预言家(AI)行动决策
         if (actionData.StartsWith("ACTION:"))
         {
+            _consecutiveActionTimeouts = 0;
             string[] parts = actionData.Split(':')[1].Split('|');
             int dir = int.Parse(parts[0]);
-            // 如果后端传回了 Epsilon，同步更新到本地，让 UI 滑条能自动跟着变（尤其是自动衰减时）
-            if (parts.Length > 1)
-            {
-                if (float.TryParse(parts[1], out float eps))
-                {
-                    trainParam.epsilon = eps;
-                }
-            }
-            // 下发 WAIT 占位符防多条指令黏连 (粘包防护)
+            if (parts.Length > 1 && float.TryParse(parts[1], out float e)) trainParam.epsilon = e;
             SendDataToPython("WAITING");
             ExecuteAIMove(dir);
         }
         else
         {
-            Debug.LogWarning($"不好，等那个 Python 小弟等太久了！(要么死机要么罢工了) - Last read: {(string.IsNullOrEmpty(actionData) ? "EMPTY" : actionData.Substring(0, Math.Min(30, actionData.Length)))}");
+            // ACTION 超时：连续 N 次失败后触发 episode 终止，防止动作链永久冻结
+            _consecutiveActionTimeouts++;
+            Debug.LogWarning($"[IPC] ACTION 超时 ({_consecutiveActionTimeouts}/{MAX_ACTION_TIMEOUTS})");
+            if (_consecutiveActionTimeouts >= MAX_ACTION_TIMEOUTS)
+            {
+                Debug.LogError("[IPC] 连续 ACTION 超时上限，触发失败终止");
+                _consecutiveActionTimeouts = 0;
+                if (!isResettingEpisode) TriggerTimeoutFailure();
+            }
+            else
+            {
+                yield return new WaitForSeconds(0.2f);
+                OnAIMoveComplete();
+            }
         }
     }
-    // 把 Python 报的 "0, 1, 2, 3" 翻译成真正操作的上下左右
     public void ExecuteAIMove(int dir)
     {
-        if (aiPlayer == null || !aiPlayer.canMove || aiPlayer.isMoving)
-            return;
-        Vector2 moveDir = dir switch
-        {
-            0 => Vector2.up,
-            1 => Vector2.down,
-            2 => Vector2.left,
-            3 => Vector2.right,
-            _ => Vector2.zero,
-        };
-        aiPlayer.TryMove(moveDir);
+        if (aiPlayer == null || !aiPlayer.canMove) return;
+        Vector2 v = dir switch { 0 => Vector2.up, 1 => Vector2.down, 2 => Vector2.left, 3 => Vector2.right, _ => Vector2.zero };
+        aiPlayer.TryMove(v);
     }
-    #endregion
-    #region Python 生命周期及 IPC 管理
-    private void StartPythonProcess()
+    private IEnumerator ResetEpisodeRoutine()
     {
-        if (isPythonProcessRunning)
-            return;
-        try
+        // yield 一帧再发 RESET：让 Python 有至少 3 次（×5ms）轮询窗口稳定读到 REWARD。
+        // 若同帧发 RESET，REWARD 字符串会在微秒内被覆盖，终端 +500 永远进不了 buffer。
+        yield return null;
+        SendDataToPython($"COMMAND:RESET|{hitCount}");
+        rewardHistory.Add(episodeTotalReward);
+        stepHistory.Add(aiPlayer.stepCount);
+        epsilonHistory.Add(trainParam.epsilon);
+        if (selectAlgorithm == 2)
         {
-            // 根据切换的算法类型判定究竟应当拉起后台哪套 Python 程序作为驱动网络
-            string scriptName = "rl_maze_ai_qlearning.py"; // 默认/保底值
-            if (selectAlgorithm == 0) scriptName = "rl_maze_ai_qlearning.py";     // Q-Learning
-            if (selectAlgorithm == 1) scriptName = "rl_maze_ai_dqn.py"; // DQN
-            if (selectAlgorithm == 2) scriptName = "rl_maze_ai_ppo.py"; // PPO
-            string realPath = Application.dataPath + "/Python/" + scriptName;
-            Debug.Log($"[IPC] 即将唤起本地算法端守护进程 ({scriptName})。 所在路径: {realPath}");
-            ProcessStartInfo psi = new ProcessStartInfo
-            {
-                FileName = "python",
-                Arguments = $"-u \"{realPath}\"",
-                UseShellExecute = true,  // true 代表它会弹出一个黑色的终端窗口，极大的方便观测 Python 的崩溃报错日志
-            };
-            pythonProcess = Process.Start(psi);
-            isPythonProcessRunning = true;
-            Debug.Log("[IPC] Python 进程成功启动, 进程号 PID=" + pythonProcess.Id);
+            _ppoMapRewardHistory.Add(episodeTotalReward);
+            _ppoMapSuccessHistory.Add(_lastEpisodeWasSuccess);
         }
-        catch (Exception e)
+        _lastEpisodeWasSuccess = false;
+        if (trainingChart != null) trainingChart.AddDataPoint(episodeTotalReward, aiPlayer.stepCount);
+        SaveHistoryData();
+        yield return new WaitForSeconds(0.2f);
+        bool switchingMap = CheckAutoTrainConvergence();
+        episodeCount++;
+        hitCount = 0;
+        episodeTotalReward = 0;
+        // pendingReward 清零：终局的 ±500 若不在此清零，会随下一局首帧 STATE 发给 Python，
+        // 导致新局 episode_reward 凭空含上一局终端奖励
+        pendingReward = 0;
+        _lastDistanceToGoal = -1;
+        _visitedCells.Clear();
+        _cellVisitCount.Clear();
+        aiPlayer.ResetPlayer();
+        isResettingEpisode = false;
+        if (!switchingMap && runMode != 0)
         {
-            Debug.LogError("[IPC] 启动 Python 算法端环境失败，请核查系统是否安装 python 且添加了环境变量: " + e.Message);
-        }
-    }
-    private void StopPythonProcess()
-    {
-        if (isPythonProcessRunning)
-        {
-            SendDataToPython("COMMAND:QUIT"); // 让后台死命执行中的 Python 进程听话自裁
-            // 稍等一会儿，给 Python 发送并响应 QUIT 的时间，防止野蛮 Kill 导致僵尸进程
-            System.Threading.Thread.Sleep(200);
-        }
-        if (pythonProcess != null && !pythonProcess.HasExited)
-        {
-            try
-            {
-                pythonProcess.Kill();
-                pythonProcess.WaitForExit(500); // 确保真的死了
-            }
-            catch { }
-        }
-        isPythonProcessRunning = false;
-        hasReceivedReady = false;
-    }
-    // 创建 “共享内存文件夹” 供 C# 和 Python 之间交互通信
-    private void InitSharedMemory()
-    {
-        try
-        {
-            // CreateOrOpen 表示如果有旧的没关干净就直接挂载（能避免大量 Restart 时的冲突）
-            mmf = MemoryMappedFile.CreateOrOpen("MazeRLSharedMemory", DATA_SIZE);
-            view = mmf.CreateViewAccessor();
-            // 必须在挂载后立即清空内存，防止上一次运行残留的 "READY" 骗过 C# 提前发送 GRID 数据
-            byte[] emptyData = new byte[DATA_SIZE];
-            view.WriteArray(0, emptyData, 0, DATA_SIZE);
-        }
-        catch (Exception e)
-        {
-            UnityEngine.Debug.LogError("[IPC] 初始化共享内存映射表失败: " + e.Message);
-        }
-    }
-    private void CloseSharedMemory()
-    {
-        view?.Dispose();
-        mmf?.Dispose();
-    }
-    /// <summary>
-    /// 通用发包接口，将字符串以 UTF-8 转换为固定长度的数据包后推断进管道。
-    /// </summary>
-    private void SendDataToPython(string data)
-    {
-        if (view == null)
-            return;
-        // PadRight 是必不可少的，空余的字节必须用 '\0' 填满，避免脏数据残留导致 Python 解析异常。
-        byte[] bytes = Encoding.UTF8.GetBytes(data.PadRight(DATA_SIZE, '\0'));
-        view.WriteArray(0, bytes, 0, bytes.Length);
-    }
-    private string ReadDataFromPython()
-    {
-        if (view == null)
-            return "";
-        byte[] bytes = new byte[DATA_SIZE];
-        view.ReadArray(0, bytes, 0, bytes.Length);
-        return Encoding.UTF8.GetString(bytes).Trim('\0');
-    }
-    // 把迷宫的地图整个背下来发给 Python，因为 Python 自己看不到画面，
-    public void SyncGridToPython()
-    {
-        MazeGenerator generator = FindAnyObjectByType<MazeGenerator>();
-        if (generator != null)
-        {
-            // 通过传输关联的种子(seed)，Python可以按种分类存档Q表日志！
-            // 必须与 MazeGenerator 使用同一套按算法+尺寸分开的 key
-            string seedKey = $"MazeRandomSeed_{selectAlgorithm}_{GameData.mazeWidth}";
-            int seed = PlayerPrefs.GetInt(seedKey, 0);
-            string gridStr = generator.GetGridString();
-            SendDataToPython($"GRID:{generator.Width}|{generator.Height}|{seed}|{gridStr}");
+            yield return new WaitForSeconds(0.1f);
+            OnAIMoveComplete();
         }
     }
     #endregion
-    #region 训练指挥调度
-    /// <summary>
-    /// 从 Python 训练日志 CSV 中恢复上次的回合数，实现 Unity 端的断点续训显示
-    /// </summary>
+    #region ========== 收敛判定与批量调度 ==========
+    private float _lastEpsilon = -1f;
+    private int _epsilonStableCount;
+    private const int EPSILON_STABLE_THRESHOLD = 5;
+    private bool CheckAutoTrainConvergence()
+    {
+        if (runMode != 3) return false;
+        return selectAlgorithm <= 1 ? CheckEpsilonConvergence() : CheckPPORewardConvergence();
+    }
+    // QL/DQN：epsilon 连续 N 局不再衰减（已到 min_epsilon）时视为收敛
+    private bool CheckEpsilonConvergence()
+    {
+        float eps = trainParam.epsilon;
+        _epsilonStableCount = (_lastEpsilon >= 0 && Mathf.Approximately(eps, _lastEpsilon))
+            ? _epsilonStableCount + 1 : 0;
+        _lastEpsilon = eps;
+        if (_epsilonStableCount < EPSILON_STABLE_THRESHOLD) return false;
+        Debug.Log($"<color=green>[Batch] {GetAlgorithmName()} epsilon 稳定 ({eps:F4})，连续 {_epsilonStableCount} 局不变，切换地图</color>");
+        _epsilonStableCount = 0; _lastEpsilon = -1f;
+        SwitchToNextMapOrAlgorithm();
+        return true;
+    }
+    // PPO 三维收敛判定：
+    //   主窗口 200 局：通关率 ≥80% 且均值 ≥100
+    //   抗回退窗口 30 局：通关率 ≥70%（防策略坍塌后历史均值蒙混过关）
+    //   兜底超时：400 局强制切换
+    private bool CheckPPORewardConvergence()
+    {
+        const int window = 200, recentWindow = 30;
+        int total = _ppoMapRewardHistory.Count;
+        if (total < window) return false;
+        float sum = 0; int successes = 0;
+        for (int i = total - window; i < total; i++)
+        {
+            sum += _ppoMapRewardHistory[i];
+            if (_ppoMapSuccessHistory[i]) successes++;
+        }
+        float mean = sum / window;
+        float successRate = (float)successes / window;
+        int recentOk = 0;
+        for (int i = total - recentWindow; i < total; i++)
+            if (_ppoMapSuccessHistory[i]) recentOk++;
+        float recentRate = (float)recentOk / recentWindow;
+        bool converged = successRate >= 0.8f && mean >= 100f && recentRate >= 0.7f;
+        bool timeout = total > 400;
+        if (!converged && !timeout) return false;
+        string reason = converged
+            ? $"收敛 (通关率:{successRate:P0}, 近30局:{recentRate:P0}, Mean:{mean:F1})"
+            : $"超时强切 ({total}局, 通关率:{successRate:P0}, Mean:{mean:F1})";
+        Debug.Log($"<color=green>[Batch] PPO {reason}，切换地图</color>");
+        _ppoMapRewardHistory.Clear();
+        _ppoMapSuccessHistory.Clear();
+        SwitchToNextMapOrAlgorithm();
+        return true;
+    }
+    private void SwitchToNextMapOrAlgorithm()
+    {
+        currentSeedIndex++;
+        var mazeGenForSeeds = FindAnyObjectByType<MazeGenerator>();
+        int maxSeeds = mazeGenForSeeds != null ? mazeGenForSeeds.experimentSeeds.Length : 5;
+        if (currentSeedIndex < maxSeeds)
+        {
+            StartCoroutine(DelayedSwapMapRoutine()); return;
+        }
+        currentSeedIndex = 0;
+        int nextAlgo = selectAlgorithm + 1;
+        if (nextAlgo > 2)
+        {
+            Debug.Log("<color=red>★★ [BATCH COMPLETE] 所有实验序列完成 ★★</color>");
+            runMode = 0; StopPythonProcess(); return;
+        }
+        StopPythonProcess();
+        SwitchAlgorithm(nextAlgo);
+        StartCoroutine(DelayedRestartPythonRoutine());
+    }
+    private IEnumerator DelayedSwapMapRoutine()
+    {
+        yield return new WaitForSeconds(0.2f);
+        var swapGen = FindAnyObjectByType<MazeGenerator>();
+        if (swapGen != null) swapGen.CreateMaze();
+        yield return new WaitForSeconds(0.2f);
+        ResetCountersForNewMap();
+        StartTrain();
+    }
+    private IEnumerator DelayedRestartPythonRoutine()
+    {
+        yield return new WaitForSeconds(1.2f);
+        // 必须重新生成迷宫：否则 MazeGenerator.currentSeed 仍是上个算法最后一张图的种子，
+        // 新算法 Python 进程会找不到对应的 .pth 文件
+        var restartGen = FindAnyObjectByType<MazeGenerator>();
+        if (restartGen != null) restartGen.CreateMaze();
+        yield return new WaitForSeconds(0.2f);
+        StartPythonProcess();
+        InitSharedMemory();
+        ResetCountersForNewMap();
+        StartTrain();
+    }
+    private void ResetCountersForNewMap()
+    {
+        episodeCount = 0; episodeTotalReward = 0f; hitCount = 0; totalSuccessCount = 0;
+        _lastDistanceToGoal = -1;
+        _lastEpsilon = -1f;
+        _epsilonStableCount = 0;
+        _visitedCells.Clear(); _cellVisitCount.Clear();
+        _ppoMapRewardHistory.Clear(); _ppoMapSuccessHistory.Clear();
+        rewardHistory.Clear(); stepHistory.Clear(); epsilonHistory.Clear();
+    }
+    #endregion
+    #region ========== 数据持久化 ==========
+    private void MigrateOldSeedKeys()
+    {
+        if (PlayerPrefs.GetInt("SeedKeyMigrated", 0) == 1) return;
+        for (int algo = 0; algo <= 2; algo++)
+        {
+            string oldKey = "MazeRandomSeed_" + algo;
+            if (!PlayerPrefs.HasKey(oldKey)) continue;
+            PlayerPrefs.SetInt($"MazeRandomSeed_{algo}_{GameData.mazeWidth}", PlayerPrefs.GetInt(oldKey));
+            PlayerPrefs.DeleteKey(oldKey);
+        }
+        PlayerPrefs.SetInt("SeedKeyMigrated", 1);
+        PlayerPrefs.Save();
+    }
+    // 训练与演示历史分开存储，防止 demo 数据污染训练曲线
+    private string GetHistoryKey()
+    {
+        string suffix = (runMode == 2) ? "_demo" : "";
+        return $"HistoryData_{selectAlgorithm}_{GameData.mazeWidth}{suffix}";
+    }
+    private int _saveFlushTickCounter;
+    private const int SAVE_FLUSH_INTERVAL = 10; // 每 10 局刷盘一次，降低注册表写入频率
+    private void SaveHistoryData()
+    {
+        string key = GetHistoryKey();
+        PlayerPrefs.SetString(key + "_Reward", string.Join(",", rewardHistory));
+        PlayerPrefs.SetString(key + "_Step", string.Join(",", stepHistory));
+        if (++_saveFlushTickCounter >= SAVE_FLUSH_INTERVAL)
+        {
+            PlayerPrefs.Save();
+            _saveFlushTickCounter = 0;
+        }
+    }
+    private void LoadHistoryData()
+    {
+        rewardHistory.Clear(); stepHistory.Clear(); epsilonHistory.Clear();
+        string key = GetHistoryKey();
+        if (PlayerPrefs.HasKey(key + "_Reward"))
+            foreach (var r in PlayerPrefs.GetString(key + "_Reward").Split(','))
+                if (float.TryParse(r, out float v)) rewardHistory.Add(v);
+        if (PlayerPrefs.HasKey(key + "_Step"))
+            foreach (var s in PlayerPrefs.GetString(key + "_Step").Split(','))
+                if (int.TryParse(s, out int v)) stepHistory.Add(v);
+    }
     private void ResumeEpisodeCount()
     {
         try
         {
             string seedKey = $"MazeRandomSeed_{selectAlgorithm}_{GameData.mazeWidth}";
             int seed = PlayerPrefs.GetInt(seedKey, 0);
-            int mazeW = GameData.mazeWidth;
-            // 根据算法类型拼出对应的 CSV 文件名（必须与 Python 端完全一致）
+            var resumeGen = FindAnyObjectByType<MazeGenerator>();
+            int mazeW = resumeGen != null ? resumeGen.Width : GameData.mazeWidth;
+            string demo = (runMode == 2) ? "_demo" : "";
             string csvName = selectAlgorithm switch
             {
-                0 => $"training_log_QL_s{mazeW}_{seed}.csv",
-                1 => $"dqn_log_s{mazeW}_{seed}.csv",
-                2 => $"ppo_log_s{mazeW}_{seed}.csv",
+                0 => $"training_log_QL{demo}_s{mazeW}_{seed}.csv",
+                1 => $"dqn{demo}_log_s{mazeW}_{seed}.csv",
+                2 => $"ppo{demo}_log_s{mazeW}_{seed}.csv",
                 _ => ""
             };
             if (string.IsNullOrEmpty(csvName)) return;
             string csvPath = Path.Combine(Application.dataPath, "Python", "training_data~", csvName);
             if (!File.Exists(csvPath))
             {
-                episodeCount = 0;
-                totalSuccessCount = 0;
-                Debug.Log("[系统] 未找到历史训练日志，回合数从 0 开始。");
+                episodeCount = totalSuccessCount = 0;
+                Debug.Log($"<color=cyan>[Resume] 新地图，从第 0 局开始 (seed={seed})</color>");
                 return;
             }
-            // 读取 CSV 最后一行的 episode 数
             string[] lines = File.ReadAllLines(csvPath);
-            if (lines.Length > 1)
+            int lastEp = 0, successes = 0;
+            for (int i = 1; i < lines.Length; i++)
             {
-                // 从尾部找到最后一行有效数据
-                for (int i = lines.Length - 1; i >= 1; i--)
+                string[] cols = lines[i].Split(',');
+                if (cols.Length >= 4 && int.TryParse(cols[0], out int ep))
                 {
-                    string line = lines[i].Trim();
-                    if (string.IsNullOrEmpty(line)) continue;
-                    string[] cols = line.Split(',');
-                    if (cols.Length >= 1 && int.TryParse(cols[0], out int lastEp))
-                    {
-                        episodeCount = lastEp;
-                        totalSuccessCount = lastEp; // 每回合都到达了终点才会记录
-                        Debug.Log($"<color=cyan>[断点续训] 从历史日志恢复：已完成 {episodeCount} 回合</color>");
-                        return;
-                    }
+                    lastEp = ep;
+                    if (float.TryParse(cols[3], out float r) && r > 50f) successes++;
                 }
             }
-            episodeCount = 0;
-            totalSuccessCount = 0;
+            episodeCount = lastEp;
+            totalSuccessCount = successes;
+            Debug.Log($"<color=cyan>[Resume] 断点续训: Episode={episodeCount} | Success={totalSuccessCount} | seed={seed}</color>");
         }
         catch (Exception e)
         {
-            Debug.LogWarning($"[系统] 读取历史训练日志失败: {e.Message}");
-            episodeCount = 0;
-            totalSuccessCount = 0;
+            // 不静默吞掉：CSV 损坏后用户需要知道续训失败，而不是局数默默归零
+            Debug.LogWarning($"[Resume] CSV 解析失败，从第 0 局开始: {e.Message}");
+            episodeCount = totalSuccessCount = 0;
         }
     }
-    /// <summary>
-    /// 发射第一次心跳包
-    /// </summary>
-    public void StartTrain()
-    {
-        if (runMode == 0 || aiPlayer == null)
-            return;
-        StartCoroutine(StartTrainRoutine());
-    }
-    private IEnumerator StartTrainRoutine()
-    {
-        // 因为 PyTorch 引入导致 Python 解释器首次启动通常需要 3~5 秒
-        // 我们必须轮询等待 Python 写入 "READY" 信号，否则直接发 GRID 极容易被后续命令覆盖导致 AI 失明！
-        float waitTime = 0;
-        string data = "";
-        // 如果 Python 已经处于运行状态且曾经握手成功，则跳过 READY 等待
-        // 因为当重新生成地图时，Python 早就进入了主循环（它是肯定不会再发一次 READY 的）。
-        // 增加 PyTorch 启动宽容度到 60 秒，因为一些 CPU 初始化深度学习环境非常慢！
-        while (!hasReceivedReady && !data.StartsWith("READY") && waitTime < 60.0f)
-        {
-            yield return new WaitForSeconds(0.1f);
-            waitTime += 0.1f;
-            data = ReadDataFromPython();
-        }
-        if (!hasReceivedReady)
-        {
-            if (waitTime >= 60.0f)
-                Debug.LogError($"[IPC - 严重超时] Python未在 60 秒内回复 READY 信号，管道建立疑似失败！");
-            else
-            {
-                Debug.Log($"[IPC] Python 已于 {waitTime:F1}s 后完全加载完毕并成功发送 READY 接头信号。");
-                hasReceivedReady = true;
-            }
-        }
-        aiPlayer.ResetPlayer();
-        hitCount = 0;
-        // 发送环境图信息
-        SyncGridToPython();
-        // 【关键修复】等待 Python 确认收到 GRID，防止被后续指令覆盖
-        float gridWait = 0;
-        while (gridWait < 10.0f)
-        {
-            yield return new WaitForSeconds(0.1f);
-            gridWait += 0.1f;
-            string response = ReadDataFromPython();
-            if (response.StartsWith("GRID_OK"))
-            {
-                Debug.Log($"[IPC] Python 已确认收到 GRID 数据 ({gridWait:F1}s)");
-                break;
-            }
-        }
-        if (gridWait >= 10.0f)
-            Debug.LogWarning("[IPC] Python 未确认 GRID 收讫，继续执行（可能导致数据错乱）");
-        yield return new WaitForSeconds(0.1f);
-        // 指针指令：如果是 DEMO(演示)，那么 Python 会强制关停 epsilon 让其实验 100% 收敛走势。
-        if (runMode == 2)
-            SendDataToPython("COMMAND:DEMO");
-        else
-        {
-            SendDataToPython("COMMAND:START");
-            // 同步恢复 Unity 端的回合计数，与 Python 端保持一致
-            ResumeEpisodeCount();
-            // PPO 自动训练开始新地图时清空奖励收敛记录
-            if (selectAlgorithm == 2 && runMode == 3)
-                _ppoMapRewardHistory.Clear();
-        }
-        yield return new WaitForSeconds(0.2f);
-        // 激活 AI 行动环路
-        OnAIMoveComplete();
-    }
-    public void StopTrain()
-    {
-        SendDataToPython("COMMAND:STOP");
-    }
-    public void PauseTrain()
-    {
-        SendDataToPython("COMMAND:PAUSE");
-        if (aiPlayer != null)
-            aiPlayer.canMove = false;
-    }
-    public void ResumeTrain()
-    {
-        SendDataToPython("COMMAND:RESUME");
-        if (aiPlayer != null)
-            aiPlayer.canMove = true;
-        OnAIMoveComplete();
-    }
-    public void ResetTrain()
-    {
-        if (aiPlayer != null)
-            aiPlayer.ResetPlayer();
-        // 重置奖励启发式状态
-        _lastDistanceToGoal = -1;
-        _visitedCells.Clear();
-        _cellVisitCount.Clear();
-        // 将旧的统计数字一并通过 RESET 告知算法模型，算法需要重置一些 Episode-Level 的数据
-        SendDataToPython($"COMMAND:RESET|{hitCount}");
-        // 确保上一个 hitCount 被安全发出后才擦除
-        hitCount = 0;
-    }
-    #region 自动化批量训练挂机管家
-    private bool CheckAutoTrainConvergence()
-    {
-        // PPO 不使用 epsilon-greedy 探索策略，需要基于奖励稳定性来判定收敛
-        if (selectAlgorithm == 2)
-        {
-            return CheckPPORewardConvergence();
-        }
-        // Q-Learning / DQN: 原有的 epsilon 稳定性判断逻辑
-        int checkEpsCount = 10;
-        if (episodeEpsilonHistory.Count < checkEpsCount) return false;
-        float firstEps = episodeEpsilonHistory[episodeEpsilonHistory.Count - checkEpsCount];
-        bool isConverged = true;
-        for (int i = episodeEpsilonHistory.Count - checkEpsCount + 1; i < episodeEpsilonHistory.Count; i++)
-        {
-            if (Mathf.Abs(episodeEpsilonHistory[i] - firstEps) > 0.0001f)
-            {
-                isConverged = false;
-                break;
-            }
-        }
-        if (isConverged)
-        {
-            Debug.Log($"<color=green>[Auto Train] 当前地图 (算法: {GetAlgorithmName()}, 种子索引: {currentSeedIndex}) 探索率已连续 {checkEpsCount} 局保持 {firstEps:F4} 不变，判定收敛！准备切换下一地图。</color>");
-            episodeEpsilonHistory.Clear();
-            SwitchToNextMapOrAlgorithm();
-            return true;
-        }
-        return false;
-    }
-    /// <summary>
-    /// PPO 专用收敛检测：基于最近 N 局奖励的「均值 + 变异系数」双重指标判断
-    /// PPO 是策略梯度算法，探索通过网络输出的概率分布自然实现，
-    /// 不存在 epsilon 衰减机制，因此改用奖励稳定性来判定收敛：
-    ///   条件1: 最近窗口期内的平均奖励 > 阈值 → 确认 agent 确实在通关
-    ///   条件2: 奖励的变异系数(CV = 标准差/均值) < 30% → 确认表现已趋于稳定
-    ///   安全阀: 单张地图超过 200 局仍未收敛则强制切换，防止无限挂机
-    /// </summary>
-    private bool CheckPPORewardConvergence()
-    {
-        int minEpisodes = 30;        // 最少需要积累 30 局数据才开始判定
-        int windowSize = 20;         // 取最近 20 局作为分析窗口
-        float minMeanReward = 5.0f;  // 平均奖励最低门槛（正值说明 agent 在通关，而非持续超时）
-        float maxCV = 0.3f;          // 变异系数(CV)最大容许值（30% 以内视为稳定）
-        int maxEpisodesPerMap = 200;  // 安全阀：单张地图最大训练局数
-        if (_ppoMapRewardHistory.Count < minEpisodes) return false;
-        // 安全阀：超过最大局数强制切换，防止永远达不到收敛却无限挂机
-        if (_ppoMapRewardHistory.Count >= maxEpisodesPerMap)
-        {
-            Debug.Log($"<color=yellow>[Auto Train] PPO 已训练 {_ppoMapRewardHistory.Count} 局仍未达收敛标准，安全阀触发 → 强制切换下一地图</color>");
-            episodeEpsilonHistory.Clear();
-            SwitchToNextMapOrAlgorithm();
-            return true;
-        }
-        // 计算最近 windowSize 局的均值
-        float sum = 0f;
-        int startIdx = _ppoMapRewardHistory.Count - windowSize;
-        for (int i = startIdx; i < _ppoMapRewardHistory.Count; i++)
-            sum += _ppoMapRewardHistory[i];
-        float mean = sum / windowSize;
-        // 计算标准差
-        float sumSqDiff = 0f;
-        for (int i = startIdx; i < _ppoMapRewardHistory.Count; i++)
-        {
-            float diff = _ppoMapRewardHistory[i] - mean;
-            sumSqDiff += diff * diff;
-        }
-        float stdDev = Mathf.Sqrt(sumSqDiff / windowSize);
-        // 计算变异系数 (Coefficient of Variation = 标准差 / 均值)
-        float cv = (Mathf.Abs(mean) > 0.01f) ? (stdDev / Mathf.Abs(mean)) : 999f;
-        // 收敛判定：奖励足够高 且 波动足够小
-        if (mean >= minMeanReward && cv < maxCV)
-        {
-            Debug.Log($"<color=green>[Auto Train] PPO 奖励收敛判定通过！最近 {windowSize} 局：均值={mean:F1}, 标准差={stdDev:F1}, 变异系数={cv:F3} (< {maxCV}) → 切换下一地图</color>");
-            episodeEpsilonHistory.Clear();
-            SwitchToNextMapOrAlgorithm();
-            return true;
-        }
-        // 每 10 局输出一次监控进度日志，方便观察训练趋势
-        if (_ppoMapRewardHistory.Count % 10 == 0)
-        {
-            string status = mean < minMeanReward ? $"均值不足(需>{minMeanReward:F1})" : $"波动过大(CV={cv:F3}>{maxCV})";
-            Debug.Log($"<color=cyan>[Auto Train] PPO 收敛监控 (第{_ppoMapRewardHistory.Count}局)：近{windowSize}局均值={mean:F1}, 标准差={stdDev:F1}, CV={cv:F3} | 未收敛原因: {status}</color>");
-        }
-        return false;
-    }
-    private void SwitchToNextMapOrAlgorithm()
-    {
-        _ppoMapRewardHistory.Clear(); // 切图/切算法时清空 PPO 奖励收敛记录
-        MazeGenerator generator = FindAnyObjectByType<MazeGenerator>();
-        currentSeedIndex++;
-        int maxMapCount = generator != null ? generator.experimentSeeds.Length : 5;
-        if (currentSeedIndex >= maxMapCount)
-        {
-            // 所有图都切完了，换算法！
-            currentSeedIndex = 0;
-            int nextAlgo = selectAlgorithm + 1;
-            // 如果连PPO都跑完了，挂机结束
-            if (nextAlgo > 2)
-            {
-                Debug.Log("<color=red>★★ [Auto Train] 所有算法的全部地图均已完美收敛！全线挂机大捷！★★</color>");
-                runMode = 0;
-                StopTrain();
-                return;
-            }
-            Debug.Log($"<color=yellow>[Auto Train] 切换至下一个算法并从头开始地图循环: {nextAlgo}</color>");
-            StopPythonProcess(); // 在切算法前必须先安全停机，不要让新选算法的初始指令发进空气里
-            SwitchAlgorithm(nextAlgo);
-            // 在 Unity 这边重新启动！
-            StartCoroutine(DelayedRestartPythonRoutine());
-        }
-        else
-        {
-            Debug.Log($"<color=yellow>[Auto Train] 切换至当前算法的下一个地图索引: {currentSeedIndex}</color>");
-            StartCoroutine(DelayedSwapMapRoutine());
-        }
-    }
-    private IEnumerator DelayedSwapMapRoutine()
-    {
-        // 防止和上次遗留的数据管道造成串扰或争抢
-        yield return new WaitForSeconds(0.2f);
-        MazeGenerator generator = FindAnyObjectByType<MazeGenerator>();
-        if (generator != null)
-        {
-            generator.CreateMaze();
-        }
-        yield return new WaitForSeconds(0.2f);
-        StartCoroutine(StartTrainRoutine());
-    }
-    private IEnumerator DelayedRestartPythonRoutine()
-    {
-        // 留时间释放文件占用和内存映射
-        yield return new WaitForSeconds(1.0f);
-        StartPythonProcess();
-        InitSharedMemory();
-        StartTrain();
-    }
-    #endregion
     #endregion
 }

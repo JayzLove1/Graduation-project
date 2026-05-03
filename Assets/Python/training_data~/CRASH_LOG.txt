@@ -1,5 +1,5 @@
 Traceback (most recent call last):
-  File "H:\unityProject\Unity_Design\Assets\Python\rl_maze_ai_dqn.py", line 320, in <module>
-    policy_net.train()
-    ^^^^^^^^^^^^^^^^
-AttributeError: 'NoneType' object has no attribute 'train'
+  File "H:\unityProject\Unity_Design\Assets\Python\rl_maze_ai_ppo.py", line 529, in <module>
+    hit_count_this_ep = int(cmd_parts[1]) if len(cmd_parts) > 1 else 0
+                        ~~~^^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: '0\x00\x00\x00\x000'

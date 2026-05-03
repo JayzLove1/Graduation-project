@@ -1,16 +1,14 @@
 using UnityEngine;
 
-// 游戏开始初始化的脚本
-// 它的作用就是：等真正的游戏场景（GameScene）加载完之后，马上告诉主管一切的 GameManager。
+// [已废弃] 此脚本不再承担任何初始化逻辑。
+// 场景初始化已由 GameManager.OnSceneLoaded 事件统一处理；保留空类只是为了避免
+// 删除文件后场景中残留 Missing Script 引用。
+//
+// 安全删除步骤：
+//   1. 在 GameScene 中找到挂载本组件的 GameObject，移除 GameInit 组件；
+//   2. 保存场景；
+//   3. 删除 GameInit.cs 与 GameInit.cs.meta。
+[System.Obsolete("GameInit 不再使用，请按文件头注释步骤从场景中移除组件后删除该文件。")]
 public class GameInit : MonoBehaviour
 {
-    private void Start()
-    {
-        // 场景一加载好，就让 GameManager 去看一下现在是什么模式。
-        // 然后 GameManager 就会决定现在的模式是自己玩、还是AI在训练、或者AI在表演，最后决定要不要启动后端的 Python 代码。
-        if (GameManager.instance != null)
-        {
-            GameManager.instance.InitAfterSceneLoaded();
-        }
-    }
 }

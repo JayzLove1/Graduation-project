@@ -99,9 +99,9 @@ BASE_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_
 OUTPUT_DIR = BASE_DIR
 
 ALGO_CONFIG = [
-    {"prefix": "training_log_",     "label": "Q-Learning", "color": "#4FC3F7", "has_epsilon": True},
-    {"prefix": "dqn_training_log_", "label": "DQN",        "color": "#81C784", "has_epsilon": True},
-    {"prefix": "ppo_training_log_", "label": "PPO",        "color": "#FFB74D", "has_epsilon": False},
+    {"prefix": "training_log_QL_", "label": "Q-Learning", "color": "#4FC3F7", "has_epsilon": True},
+    {"prefix": "dqn_log_",         "label": "DQN",        "color": "#81C784", "has_epsilon": True},
+    {"prefix": "ppo_log_",         "label": "PPO",        "color": "#FFB74D", "has_epsilon": False},
 ]
 
 # ==========================================================================

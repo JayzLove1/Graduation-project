@@ -1,70 +1,74 @@
 using UnityEngine;
 using UnityEngine.UI;
+
 namespace MazeAI.UI
 {
-    /// <summary>
-    /// 训练超参数实时调节面板
-    /// 这里的改动会直接写进 GameManager 的 trainParam，并同步给 Python 进程
-    /// </summary>
+    // 超参数实时控制面板：UI 输入 → GameManager → Python IPC
+    // 防抖：0.5s 内多次修改只推送一次，避免高频 IPC 阻塞
     public class TrainingParamUI : MonoBehaviour
     {
-        [Header("UI 控件引用")]
-        public InputField lrInput;
-        public InputField neuralLrInput;
-        public InputField epsilonInput;
-        public InputField gammaInput;
-        public InputField batchSizeInput;
-        [Header("更新间隔设置")]
-        // 防抖：不用每帧都更新给 Python，减少 IPC 通信开销
-        private float _lastUpdateTime = 0;
+        // ========== UI 控件 ==========
+        [Header("超参数输入框")]
+        public InputField lrInput;        // 学习率
+        public InputField neuralLrInput;  // 神经网络学习率 (Adam LR)
+        public InputField epsilonInput;   // 探索率 / PPO 熵系数
+        public InputField gammaInput;     // 折扣因子
+        public InputField batchSizeInput; // 批次大小（整数）
+
+        // ========== 防抖状态 ==========
+        private float _lastUpdateTime;
+        private bool  _hasPendingUpdate;
         private const float MinUpdateInterval = 0.5f;
-        private bool _hasPendingUpdate = false;
+
+        // ========== 初始化 ==========
         private void Start()
         {
-            // 1. 初始化输入框的默认值（从 GameManager 同步数据）
+            // 从 GameManager 恢复上次的参数到 UI
             if (GameManager.instance != null)
             {
                 var tp = GameManager.instance.trainParam;
                 UpdateInputTexts(tp.lr, tp.algoLr, tp.epsilon, tp.gamma, tp.batchSize);
             }
-            // 2. 绑定事件监听器 (使用 OnEndEdit：当玩家输完数值按回车或点开时触发同步)
-            lrInput.onEndEdit.AddListener(val => { if (float.TryParse(val, out float f)) { GameManager.instance.trainParam.lr = f; MarkForUpdate(); } });
-            neuralLrInput.onEndEdit.AddListener(val => { if (float.TryParse(val, out float f)) { GameManager.instance.trainParam.algoLr = f; MarkForUpdate(); } });
-            epsilonInput.onEndEdit.AddListener(val => { if (float.TryParse(val, out float f)) { GameManager.instance.trainParam.epsilon = f; MarkForUpdate(); } });
-            gammaInput.onEndEdit.AddListener(val => { if (float.TryParse(val, out float f)) { GameManager.instance.trainParam.gamma = f; MarkForUpdate(); } });
-            batchSizeInput.onEndEdit.AddListener(val => { if (int.TryParse(val, out int i)) { GameManager.instance.trainParam.batchSize = i; MarkForUpdate(); } });
+
+            // OnEndEdit 模式：用户确认输入后才触发，避免中途字符触发无效更新
+            lrInput.onEndEdit.AddListener(val        => { if (float.TryParse(val, out float f))           { GameManager.instance.trainParam.lr        = f; MarkForUpdate(); } });
+            neuralLrInput.onEndEdit.AddListener(val  => { if (float.TryParse(val, out float f))           { GameManager.instance.trainParam.algoLr    = f; MarkForUpdate(); } });
+            epsilonInput.onEndEdit.AddListener(val   => { if (float.TryParse(val, out float f))           { GameManager.instance.trainParam.epsilon   = f; MarkForUpdate(); } });
+            gammaInput.onEndEdit.AddListener(val     => { if (float.TryParse(val, out float f))           { GameManager.instance.trainParam.gamma     = f; MarkForUpdate(); } });
+            // batchSize 用 int.TryParse，防止输入小数点时误更新为 0
+            batchSizeInput?.onEndEdit.AddListener(val => { if (int.TryParse(val, out int n) && n > 0)     { GameManager.instance.trainParam.batchSize = n; MarkForUpdate(); } });
         }
-        private void MarkForUpdate()
-        {
-            _hasPendingUpdate = true;
-        }
-        private void UpdateInputTexts(float lr, float algoLr, float eps, float gamma, int batch)
-        {
-            // 格式化输出到输入框，防止长浮点数看着乱
-            if (!lrInput.isFocused) lrInput.text = lr.ToString("F4");
-            if (!neuralLrInput.isFocused) neuralLrInput.text = algoLr.ToString("F4");
-            if (!epsilonInput.isFocused) epsilonInput.text = eps.ToString("F4");
-            if (!gammaInput.isFocused) gammaInput.text = gamma.ToString("F2");
-            if (!batchSizeInput.isFocused) batchSizeInput.text = batch.ToString();
-        }
+
+        // ========== 更新循环 ==========
         private void Update()
         {
-            // 实时反向同步：如果 Python 端更新了 Epsilon (比如自动衰减)，我们要反向显示在输入框里
+            // Python 端（如 PPO 熵衰减）会回传 epsilon，未处于编辑中时同步到 UI
             if (GameManager.instance != null && !_hasPendingUpdate)
             {
                 var tp = GameManager.instance.trainParam;
                 UpdateInputTexts(tp.lr, tp.algoLr, tp.epsilon, tp.gamma, tp.batchSize);
             }
-            // 防抖逻辑：只有改变了参数，且距离上一次同步超过一定时间，才会发送给 Python
+
+            // 防抖到期后批量推送至 Python
             if (_hasPendingUpdate && Time.time - _lastUpdateTime > MinUpdateInterval)
             {
-                if (GameManager.instance != null)
-                {
-                    GameManager.instance.UpdateRealtimeParams();
-                }
-                _lastUpdateTime = Time.time;
+                GameManager.instance?.UpdateRealtimeParams();
+                _lastUpdateTime   = Time.time;
                 _hasPendingUpdate = false;
             }
+        }
+
+        // ========== 私有工具 ==========
+        private void MarkForUpdate() => _hasPendingUpdate = true;
+
+        private void UpdateInputTexts(float lr, float algoLr, float eps, float gamma, int batch)
+        {
+            if (!lrInput.isFocused)        lrInput.text        = lr.ToString("F4");
+            if (!neuralLrInput.isFocused)  neuralLrInput.text  = algoLr.ToString("F4");
+            if (!epsilonInput.isFocused)   epsilonInput.text   = eps.ToString("F4");
+            if (!gammaInput.isFocused)     gammaInput.text     = gamma.ToString("F2");
+            if (batchSizeInput != null && !batchSizeInput.isFocused)
+                batchSizeInput.text = batch.ToString();
         }
     }
 }
